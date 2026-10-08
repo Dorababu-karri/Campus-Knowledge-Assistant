@@ -9,21 +9,39 @@ export const Route = createFileRoute('/')({ component: App })
 const chatWithAgent = createServerFn({ method: 'POST' })
   .validator((message: string) => message)
   .handler(async ({ data: message }) => {
-    // 1. We receive the message on the backend
     if (!message) throw new Error('Message is required')
 
-    // 2. Simulate AI thinking delay (800ms)
-    await new Promise(resolve => setTimeout(resolve, 800))
+    // Forward the question to our local Python FastAPI server
+    try {
+      const response = await fetch('http://127.0.0.1:8000/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: message })
+      });
 
-    // 3. Return the JSON payload back to the frontend
-    return {
-      response: "This is a temporary response. The RAG backend will be connected in a later milestone."
+      if (!response.ok) {
+        throw new Error(`Python API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      console.error("Failed to fetch from Python API:", error);
+      throw new Error("Failed to connect to the RAG engine. Is the FastAPI server running?");
     }
   })
+
+type Source = {
+  document: string
+  page?: number
+  chunk_id: string
+  text: string
+}
 
 type Message = {
   role: 'user' | 'assistant'
   content: string
+  sources?: Source[]
 }
 
 function App() {
@@ -47,7 +65,11 @@ function App() {
       // Call the Server Function directly. It handles the HTTP POST request under the hood!
       const data = await chatWithAgent({ data: userMessage })
       
-      setMessages(prev => [...prev, { role: 'assistant', content: data.response }])
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: data.answer,
+        sources: data.sources
+      }])
     } catch (err: any) {
       setError(err.message || 'An error occurred while connecting to the server.')
     } finally {
@@ -88,6 +110,23 @@ function App() {
                   }`}
                 >
                   {msg.content}
+                  
+                  {msg.sources && msg.sources.length > 0 && (
+                    <div className="mt-3 pt-3 border-t border-gray-200">
+                      <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Sources:</p>
+                      <div className="space-y-2">
+                        {msg.sources.map((source, idx) => (
+                          <div key={idx} className="bg-white/60 rounded p-2 text-xs border border-gray-200 shadow-sm">
+                            <div className="font-medium text-[var(--sea-ink)] flex items-center justify-between mb-1">
+                              <span>📚 {source.document}</span>
+                              {source.page && <span className="bg-gray-200 px-1.5 rounded-sm">Page {source.page}</span>}
+                            </div>
+                            <p className="text-gray-500 line-clamp-2 italic">"{source.text}"</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             ))

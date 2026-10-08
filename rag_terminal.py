@@ -45,7 +45,8 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100, source_file
             "id": f"{source_filename}_chunk_{chunk_id}",
             "text": chunk_text_content,
             "metadata": {
-                "source": source_filename,
+                "document": source_filename,
+                "chunk_id": f"{source_filename}_chunk_{chunk_id}",
                 "start_char": start,
                 "end_char": min(end, text_length)
             }
@@ -73,13 +74,15 @@ def chunk_pages(pages: List[Dict[str, Any]], chunk_size: int = 500, overlap: int
             end = start + chunk_size
             chunk_text_content = text[start:end]
             
+            chunk_id_str = f"{source_filename}_p{page_num}_{chunk_id}"
             chunk = {
                 # Format: filename_page_chunkID
-                "id": f"{source_filename}_p{page_num}_{chunk_id}",
+                "id": chunk_id_str,
                 "text": chunk_text_content,
                 "metadata": {
-                    "source": source_filename,
+                    "document": source_filename,
                     "page": page_num,
+                    "chunk_id": chunk_id_str,
                     "start_char": start,
                     "end_char": min(end, text_length)
                 }
@@ -196,14 +199,15 @@ def retrieve_similar_chunks(collection, question: str, top_k: int = 5, model_nam
     )
     return results
 
-def generate_answer(question: str, retrieved_docs: List[str], retrieved_metadatas: List[Dict[str, Any]], model_name: str = 'llama3.2'):
-    """Constructs a strict prompt with context and streams the LLM response to the terminal."""
+def generate_answer(question: str, retrieved_docs: List[str], retrieved_metadatas: List[Dict[str, Any]], model_name: str = 'llama3.2', stream_to_terminal: bool = True) -> str:
+    """Constructs a strict prompt with context and generates the LLM response."""
     # 1. Format the retrieved chunks so the LLM can cleanly read them
     context_str = ""
     for i, (doc, metadata) in enumerate(zip(retrieved_docs, retrieved_metadatas)):
         # Append page info if it exists (for PDFs)
         page_info = f", Page {metadata['page']}" if 'page' in metadata else ""
-        context_str += f"[Source {i+1}: {metadata['source']}{page_info}]:\n{doc}\n\n"
+        document_name = metadata.get('document', metadata.get('source', 'Unknown Document'))
+        context_str += f"[Source {i+1}: {document_name}{page_info}]:\n{doc}\n\n"
         
     # 2. Construct the strict prompt
     prompt = f"""You are a strict and helpful Campus Knowledge Assistant.
@@ -221,19 +225,36 @@ USER QUESTION:
 {question}
 """
 
-    print("\nAssistant: ", end="", flush=True)
+    if stream_to_terminal:
+        print("\nAssistant: ", end="", flush=True)
+        
     try:
-        # 3. Call Ollama with stream=True so the response prints word-by-word
-        stream = ollama.chat(
-            model=model_name,
-            messages=[{'role': 'user', 'content': prompt}],
-            stream=True
-        )
-        for chunk in stream:
-            print(chunk['message']['content'], end='', flush=True)
-        print("\n")
+        # 3. Call Ollama
+        if stream_to_terminal:
+            stream = ollama.chat(
+                model=model_name,
+                messages=[{'role': 'user', 'content': prompt}],
+                stream=True
+            )
+            full_response = ""
+            for chunk in stream:
+                content = chunk['message']['content']
+                full_response += content
+                print(content, end='', flush=True)
+            print("\n")
+            return full_response
+        else:
+            response = ollama.chat(
+                model=model_name,
+                messages=[{'role': 'user', 'content': prompt}],
+                stream=False
+            )
+            return response['message']['content']
     except Exception as e:
-        print(f"\n[Error generating response: {e}]\n")
+        error_msg = f"[Error generating response: {e}]"
+        if stream_to_terminal:
+            print(f"\n{error_msg}\n")
+        return error_msg
 
 
 if __name__ == "__main__":
@@ -250,15 +271,18 @@ if __name__ == "__main__":
         print(f"Loading {os.path.basename(txt_path)}...")
         all_chunks.extend(process_document(txt_path))
         
-    # For testing, we only process ONE small PDF from the policies folder to avoid a massive embedding process
-    pdf_test_path = os.path.join("data", "policies", "Attendance-Policy.pdf")
-    if os.path.exists(pdf_test_path):
-        print(f"Loading {os.path.basename(pdf_test_path)}...")
-        pdf_chunks = process_document(pdf_test_path)
-        all_chunks.extend(pdf_chunks)
-        print(f"Extracted chunks from PDF.")
+    # Process ALL PDFs in the policies folder
+    policies_dir = os.path.join("data", "policies")
+    if os.path.exists(policies_dir):
+        for filename in os.listdir(policies_dir):
+            if filename.endswith('.pdf'):
+                pdf_path = os.path.join(policies_dir, filename)
+                print(f"Loading {filename}...")
+                pdf_chunks = process_document(pdf_path)
+                all_chunks.extend(pdf_chunks)
+                print(f"Extracted chunks from {filename}.")
     else:
-        print(f"Test PDF not found at {pdf_test_path}")
+        print(f"Policies folder not found at {policies_dir}")
 
     print(f"Total chunks created: {len(all_chunks)}")
     
@@ -315,7 +339,8 @@ if __name__ == "__main__":
             print("Sources Consulted:")
             for i, metadata in enumerate(retrieved_metadatas):
                 page_info = f" (Page {metadata['page']})" if 'page' in metadata else ""
-                print(f"[{i+1}] {metadata['source']}{page_info} (chars: {metadata['start_char']}-{metadata['end_char']})")
+                document_name = metadata.get('document', metadata.get('source', 'Unknown Document'))
+                print(f"[{i+1}] {document_name}{page_info} (chars: {metadata['start_char']}-{metadata['end_char']})")
             print("-" * 50)
             
         except KeyboardInterrupt:
