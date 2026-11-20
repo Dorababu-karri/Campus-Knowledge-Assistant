@@ -1,3 +1,9 @@
-chromadb
-ollama
-pypdf
+# Campus Knowledge Assistant - Backend Requirements
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+chromadb>=0.5.0
+ollama>=0.3.0
+pypdf>=4.0.0
+requests>=2.31.0
+python-multipart>=0.0.9
+pydantic>=2.7.0

@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  # ----------------------------------------------------------------------------
+  # Ollama LLM & Embedding Service
+  # ----------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: campus-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:11434/api/tags || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ----------------------------------------------------------------------------
+  # FastAPI RAG Backend (ChromaDB + RBAC + SSE Streaming)
+  # ----------------------------------------------------------------------------
+  rag-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.rag
+    container_name: campus-rag-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - RAG_INTERNAL_SECRET=campus_rag_secret_2026
+      - OLLAMA_HOST=http://ollama:11434
+    volumes:
+      - ./chroma_db:/app/chroma_db
+      - ./data:/app/data
+      - ./policies:/app/policies
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8000/ -H 'X-Internal-Secret: campus_rag_secret_2026' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ----------------------------------------------------------------------------
+  # TanStack Start Web Application & Chat Console
+  # ----------------------------------------------------------------------------
+  web-app:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: campus-web-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - RAG_INTERNAL_SECRET=campus_rag_secret_2026
+      - RAG_API_URL=http://rag-backend:8000
+    volumes:
+      - ./web-app/data:/app/web-app/data
+    depends_on:
+      rag-backend:
+        condition: service_healthy
+
+volumes:
+  ollama_models:
+    name: campus_ollama_models
+

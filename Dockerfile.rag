@@ -1,0 +1,37 @@
+# ==============================================================================
+# Campus Knowledge Assistant - FastAPI RAG Backend
+# ==============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency requirements and install
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application source code
+COPY rag_api.py .
+COPY rag_terminal.py .
+COPY document_permissions.py .
+
+# Create directories for persistent ChromaDB vector store and document data
+RUN mkdir -p /app/chroma_db /app/data /app/policies
+
+# Configuration environment variables
+ENV PYTHONUNBUFFERED=1 \
+    RAG_INTERNAL_SECRET=campus_rag_secret_2026 \
+    OLLAMA_HOST=http://ollama:11434
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://127.0.0.1:8000/ -H "X-Internal-Secret: campus_rag_secret_2026" || exit 1
+
+CMD ["uvicorn", "rag_api:app", "--host", "0.0.0.0", "--port", "8000"]
+

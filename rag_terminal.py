@@ -1,9 +1,10 @@
 import os
 import sys
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import ollama
 import chromadb
 from pypdf import PdfReader
+from document_permissions import get_document_permissions, VALID_ROLES, VALID_DEPARTMENTS
 
 # --- 1. FILE LOADING & CHUNKING ---
 
@@ -30,7 +31,8 @@ def load_pdf_pages(file_path: str) -> List[Dict[str, Any]]:
     return pages
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100, source_filename: str = "") -> List[Dict[str, Any]]:
-    """Splits plain text into overlapping chunks."""
+    """Splits plain text into overlapping chunks with RBAC permissions."""
+    perms = get_document_permissions(source_filename)
     chunks = []
     start = 0
     text_length = len(text)
@@ -48,7 +50,9 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100, source_file
                 "document": source_filename,
                 "chunk_id": f"{source_filename}_chunk_{chunk_id}",
                 "start_char": start,
-                "end_char": min(end, text_length)
+                "end_char": min(end, text_length),
+                "access_level": perms["access_level"],
+                "department": perms["department"]
             }
         }
         chunks.append(chunk)
@@ -59,7 +63,7 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100, source_file
     return chunks
 
 def chunk_pages(pages: List[Dict[str, Any]], chunk_size: int = 500, overlap: int = 100) -> List[Dict[str, Any]]:
-    """Chunks the text of each page individually, preserving page metadata."""
+    """Chunks the text of each page individually, preserving page metadata and RBAC permissions."""
     chunks = []
     chunk_id = 0
     
@@ -69,6 +73,7 @@ def chunk_pages(pages: List[Dict[str, Any]], chunk_size: int = 500, overlap: int
         text_length = len(text)
         source_filename = page["source"]
         page_num = page["page_num"]
+        perms = get_document_permissions(source_filename)
         
         while start < text_length:
             end = start + chunk_size
@@ -84,7 +89,9 @@ def chunk_pages(pages: List[Dict[str, Any]], chunk_size: int = 500, overlap: int
                     "page": page_num,
                     "chunk_id": chunk_id_str,
                     "start_char": start,
-                    "end_char": min(end, text_length)
+                    "end_char": min(end, text_length),
+                    "access_level": perms["access_level"],
+                    "department": perms["department"]
                 }
             }
             chunks.append(chunk)
@@ -94,13 +101,16 @@ def chunk_pages(pages: List[Dict[str, Any]], chunk_size: int = 500, overlap: int
     return chunks
 
 def process_document(file_path: str, chunk_size: int = 500, overlap: int = 100) -> List[Dict[str, Any]]:
-    """Loads a document (.txt or .pdf) and returns chunked data."""
+    """Loads a document (.txt or .pdf) and returns chunked data with verified permissions."""
+    filename = os.path.basename(file_path)
+    # Fail safely if document permissions cannot be determined
+    get_document_permissions(filename)
+    
     if file_path.endswith('.pdf'):
         pages = load_pdf_pages(file_path)
         return chunk_pages(pages, chunk_size, overlap)
     elif file_path.endswith('.txt'):
         raw_text = load_document(file_path)
-        filename = os.path.basename(file_path)
         return chunk_text(raw_text, chunk_size, overlap, filename)
     else:
         print(f"Unsupported file format: {file_path}")
@@ -187,19 +197,123 @@ def store_chunks_in_chroma(collection, chunks: List[Dict[str, Any]]):
 
 # --- 3. RETRIEVAL & GENERATION ---
 
-def retrieve_similar_chunks(collection, question: str, top_k: int = 5, model_name: str = 'nomic-embed-text'):
-    """Takes a user question, generates its embedding, and searches ChromaDB for similar chunks."""
+# Configuration for Milestone 6 Retrieval Quality & Milestone 7.2 RBAC
+DEFAULT_TOP_K: int = 8
+MAX_DISTANCE: float = 0.42
+NO_RELEVANT_INFO_MESSAGE: str = (
+    "I couldn't find sufficiently relevant information in the available university policy documents."
+)
+
+def build_access_filter(role: str, department: str = "general") -> Optional[Dict[str, Any]]:
+    """
+    Builds a ChromaDB where filter based on user role and department.
+    Validates role and department. Fails closed on invalid inputs.
+    
+    Access Rules:
+    - PUBLIC: access_level = 'public'
+    - STUDENT: access_level IN ['public', 'student']
+    - STAFF: access_level IN ['public', 'student'] OR (access_level = 'staff' AND department IN ['all', user_dept])
+    - ADMIN: None (No restrictions)
+    """
+    if not role or not isinstance(role, str):
+        raise ValueError("Invalid role: Role must be a non-empty string. Access denied.")
+    
+    clean_role = role.strip().lower()
+    clean_dept = (department or "general").strip().lower()
+
+    if clean_role not in VALID_ROLES:
+        raise ValueError(f"Invalid role '{clean_role}'. Access denied.")
+
+    if clean_role == "staff" and clean_dept not in VALID_DEPARTMENTS:
+        raise ValueError(f"Invalid department '{clean_dept}'. Access denied.")
+
+    if clean_role == "admin":
+        return None
+
+    if clean_role == "public":
+        return {"access_level": "public"}
+
+    if clean_role == "student":
+        return {"access_level": {"$in": ["public", "student"]}}
+
+    if clean_role == "staff":
+        return {
+            "$or": [
+                {"access_level": "public"},
+                {"access_level": "student"},
+                {
+                    "$and": [
+                        {"access_level": "staff"},
+                        {"department": {"$in": ["all", clean_dept]}}
+                    ]
+                }
+            ]
+        }
+
+    # Fail closed on any unhandled value
+    raise ValueError(f"Unhandled role '{clean_role}'. Access denied.")
+
+def retrieve_similar_chunks(
+    collection,
+    question: str,
+    top_k: int = DEFAULT_TOP_K,
+    where_filter: Optional[Dict[str, Any]] = None,
+    model_name: str = 'nomic-embed-text'
+):
+    """Takes a user question, generates its embedding, and searches ChromaDB for candidate chunks with pre-retrieval filtering."""
     # 1. Generate an embedding for the user's question using the EXACT SAME model
     question_embedding = generate_embedding(question, model_name)
     
-    # 2. Query the ChromaDB collection using the question's embedding
-    results = collection.query(
-        query_embeddings=[question_embedding],
-        n_results=top_k
-    )
+    # 2. Query the ChromaDB collection using the question's embedding and optional where filter
+    query_kwargs = {
+        "query_embeddings": [question_embedding],
+        "n_results": top_k
+    }
+    if where_filter is not None:
+        query_kwargs["where"] = where_filter
+
+    results = collection.query(**query_kwargs)
     return results
 
-def generate_answer(question: str, retrieved_docs: List[str], retrieved_metadatas: List[Dict[str, Any]], model_name: str = 'llama3.2', stream_to_terminal: bool = True) -> str:
+def filter_chunks_by_distance(results: Dict[str, Any], max_distance: float = MAX_DISTANCE) -> Dict[str, Any]:
+    """Filters ChromaDB query results by cosine distance threshold (distance <= max_distance).
+    Smaller distance means higher semantic similarity.
+    """
+    raw_docs = results.get('documents', [[]])[0]
+    raw_metas = results.get('metadatas', [[]])[0]
+    raw_ids = results.get('ids', [[]])[0]
+    raw_dists = results.get('distances', [[]])[0]
+
+    filtered_docs = []
+    filtered_metas = []
+    filtered_ids = []
+    filtered_dists = []
+
+    for doc, meta, cid, dist in zip(raw_docs, raw_metas, raw_ids, raw_dists):
+        if dist <= max_distance:
+            filtered_docs.append(doc)
+            filtered_metas.append(meta)
+            filtered_ids.append(cid)
+            filtered_dists.append(dist)
+
+    return {
+        'documents': [filtered_docs],
+        'metadatas': [filtered_metas],
+        'ids': [filtered_ids],
+        'distances': [filtered_dists],
+        'total_candidates': len(raw_docs),
+        'accepted_count': len(filtered_docs),
+        'rejected_count': len(raw_docs) - len(filtered_docs)
+    }
+
+def generate_answer(
+    question: str,
+    retrieved_docs: List[str],
+    retrieved_metadatas: List[Dict[str, Any]],
+    model_name: str = 'llama3.2',
+    stream_to_terminal: bool = True,
+    history: Optional[List[Dict[str, str]]] = None
+) -> str:
     """Constructs a strict prompt with context and generates the LLM response."""
     # 1. Format the retrieved chunks so the LLM can cleanly read them
     context_str = ""
@@ -208,6 +322,18 @@ def generate_answer(question: str, retrieved_docs: List[str], retrieved_metadata
         page_info = f", Page {metadata['page']}" if 'page' in metadata else ""
         document_name = metadata.get('document', metadata.get('source', 'Unknown Document'))
         context_str += f"[Source {i+1}: {document_name}{page_info}]:\n{doc}\n\n"
+
+    # Optional conversational history (last 4 turns) to resolve follow-up pronouns
+    history_str = ""
+    if history:
+        formatted_history = []
+        for h in history[-4:]:
+            role_label = h.get('role', 'user').capitalize()
+            content = h.get('content', '')
+            if content:
+                formatted_history.append(f"{role_label}: {content}")
+        if formatted_history:
+            history_str = "PREVIOUS CONVERSATION CONTEXT:\n" + "\n".join(formatted_history) + "\n\n"
         
     # 2. Construct the strict prompt
     prompt = f"""You are a strict and helpful Campus Knowledge Assistant.
@@ -217,8 +343,9 @@ CRITICAL RULES:
 1. If the provided context does not contain enough information to answer the question, you must explicitly state that the policy information provided does not contain the answer.
 2. Do NOT invent rules, facts, or policies.
 3. When you use information from the context, cite the source using [Source 1], [Source 2], etc.
+4. You may use previous conversation context only to resolve follow-up references (such as pronouns or referring back to a previously mentioned topic). All factual policy rules must come strictly from the CONTEXT.
 
-CONTEXT:
+{history_str}CONTEXT:
 {context_str}
 
 USER QUESTION:
@@ -255,6 +382,59 @@ USER QUESTION:
         if stream_to_terminal:
             print(f"\n{error_msg}\n")
         return error_msg
+
+def generate_answer_stream(
+    question: str,
+    retrieved_docs: List[str],
+    retrieved_metadatas: List[Dict[str, Any]],
+    model_name: str = 'llama3.2',
+    history: Optional[List[Dict[str, str]]] = None
+):
+    """Yields tokens incrementally as they are generated by the LLM."""
+    context_str = ""
+    for i, (doc, metadata) in enumerate(zip(retrieved_docs, retrieved_metadatas)):
+        page_info = f", Page {metadata['page']}" if 'page' in metadata else ""
+        document_name = metadata.get('document', metadata.get('source', 'Unknown Document'))
+        context_str += f"[Source {i+1}: {document_name}{page_info}]:\n{doc}\n\n"
+
+    history_str = ""
+    if history:
+        formatted_history = []
+        for h in history[-4:]:
+            role_label = h.get('role', 'user').capitalize()
+            content = h.get('content', '')
+            if content:
+                formatted_history.append(f"{role_label}: {content}")
+        if formatted_history:
+            history_str = "PREVIOUS CONVERSATION CONTEXT:\n" + "\n".join(formatted_history) + "\n\n"
+
+    prompt = f"""You are a strict and helpful Campus Knowledge Assistant.
+Your job is to answer the user's question using ONLY the provided policy context below.
+
+CRITICAL RULES:
+1. If the provided context does not contain enough information to answer the question, you must explicitly state that the policy information provided does not contain the answer.
+2. Do NOT invent rules, facts, or policies.
+3. When you use information from the context, cite the source using [Source 1], [Source 2], etc.
+4. You may use previous conversation context only to resolve follow-up references. All factual policy rules must come strictly from the CONTEXT.
+
+{history_str}CONTEXT:
+{context_str}
+
+USER QUESTION:
+{question}
+"""
+    try:
+        stream = ollama.chat(
+            model=model_name,
+            messages=[{'role': 'user', 'content': prompt}],
+            stream=True
+        )
+        for chunk in stream:
+            content = chunk.get('message', {}).get('content', '')
+            if content:
+                yield content
+    except Exception as e:
+        yield f"[Error generating streaming response: {e}]"
 
 
 if __name__ == "__main__":
@@ -322,25 +502,27 @@ if __name__ == "__main__":
             if not user_input:
                 continue
                 
-            # RAG STEP 1: Retrieve relevant chunks from database
-            results = retrieve_similar_chunks(collection, user_input, top_k=5)
-            retrieved_documents = results['documents'][0]
-            retrieved_metadatas = results['metadatas'][0]
+            # RAG STEP 1: Retrieve candidate chunks and filter by distance
+            results = retrieve_similar_chunks(collection, user_input, top_k=DEFAULT_TOP_K)
+            filtered = filter_chunks_by_distance(results, max_distance=MAX_DISTANCE)
+            retrieved_documents = filtered['documents'][0]
+            retrieved_metadatas = filtered['metadatas'][0]
+            retrieved_distances = filtered['distances'][0]
             
             if not retrieved_documents:
-                print("No relevant documents found in the database.")
+                print(f"\nAssistant: {NO_RELEVANT_INFO_MESSAGE}\n")
                 continue
                 
-            # RAG STEP 2: Generate the answer using the LLM
+            # RAG STEP 2: Generate the answer using the LLM (only with accepted chunks)
             generate_answer(user_input, retrieved_documents, retrieved_metadatas, model_name='llama3.2')
             
             # RAG STEP 3: Display the sources
             print("-" * 50)
-            print("Sources Consulted:")
-            for i, metadata in enumerate(retrieved_metadatas):
+            print(f"Sources Consulted ({len(retrieved_documents)} accepted, {filtered['rejected_count']} rejected by threshold <= {MAX_DISTANCE}):")
+            for i, (metadata, dist) in enumerate(zip(retrieved_metadatas, retrieved_distances)):
                 page_info = f" (Page {metadata['page']})" if 'page' in metadata else ""
                 document_name = metadata.get('document', metadata.get('source', 'Unknown Document'))
-                print(f"[{i+1}] {document_name}{page_info} (chars: {metadata['start_char']}-{metadata['end_char']})")
+                print(f"[{i+1}] {document_name}{page_info} | Distance: {dist:.4f} (chars: {metadata['start_char']}-{metadata['end_char']})")
             print("-" * 50)
             
         except KeyboardInterrupt:

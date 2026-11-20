@@ -19,7 +19,7 @@ export const Route = createRootRoute({
         content: 'width=device-width, initial-scale=1',
       },
       {
-        title: 'TanStack Start Starter',
+        title: 'Campus Knowledge Assistant | Institutional Policy Intelligence',
       },
     ],
     links: [
@@ -39,7 +39,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
         <HeadContent />
       </head>
-      <body className="font-sans antialiased [overflow-wrap:anywhere] selection:bg-[rgba(79,184,178,0.24)]">
+      <body className="font-sans antialiased [overflow-wrap:anywhere] selection:bg-[rgba(98,126,234,0.3)] selection:text-white">
         <Header />
         {children}
         <Footer />
